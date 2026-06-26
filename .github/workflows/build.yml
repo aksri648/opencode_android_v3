@@ -58,17 +58,7 @@ jobs:
 
       - name: Build debug APK
         working-directory: frontend/android
-        run: |
-          ./gradlew assembleDebug
-
-      - name: Rename APK
-        id: rename
-        run: |
-          mkdir -p release
-          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
-          APK_NAME="mobileaiworkspace_${TIMESTAMP}_v0.apk"
-          cp frontend/android/app/build/outputs/apk/debug/app-debug.apk "release/${APK_NAME}"
-          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+        run: ./gradlew assembleDebug
 
       - name: Determine next version
         id: version
@@ -100,6 +90,15 @@ jobs:
             const nextVersion = maxVersion + 1;
             core.setOutput('version', nextVersion);
             core.setOutput('tag', `${tagPrefix}${nextVersion}`);
+
+      - name: Rename APK
+        id: rename
+        run: |
+          mkdir -p release
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+          APK_NAME="mobileaiworkspace_${TIMESTAMP}_v${{ steps.version.outputs.version }}.apk"
+          cp frontend/android/app/build/outputs/apk/debug/app-debug.apk "release/${APK_NAME}"
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
