@@ -159,6 +159,21 @@ class DaytonaService {
     const workspace = this.workspaces.get(terminal.workspaceId);
     if (!workspace?.sandbox) throw new Error('Workspace not found');
 
+    // Clean up any existing connection for this terminal before creating a new one
+    const existingConn = this.sshConnections.get(terminalId);
+    if (existingConn) {
+      console.log(`[SSH] Cleaning up existing connection for terminal ${terminalId}`);
+      try {
+        existingConn.stream.removeAllListeners();
+        existingConn.client.removeAllListeners();
+        existingConn.stream.close();
+        existingConn.client.end();
+      } catch {
+        // Ignore cleanup errors
+      }
+      this.sshConnections.delete(terminalId);
+    }
+
     // Get SSH access from Daytona
     const sshAccess = await workspace.sandbox.createSshAccess();
     
@@ -184,6 +199,18 @@ class DaytonaService {
 
     const sshClient = new SSHClient();
 
+    // Guard flag to prevent calling onClose multiple times
+    // (stream 'close' + client 'close' both fire)
+    let closeCalled = false;
+    let settled = false; // guard for promise resolve/reject
+
+    const handleClose = () => {
+      if (closeCalled) return;
+      closeCalled = true;
+      this.sshConnections.delete(terminalId);
+      onClose?.();
+    };
+
     return new Promise<void>((resolve, reject) => {
       sshClient.on('ready', () => {
         console.log(`[SSH] Connected for terminal ${terminalId}`);
@@ -197,7 +224,10 @@ class DaytonaService {
             if (err) {
               console.error(`[SSH] Shell error for terminal ${terminalId}:`, err);
               onError?.(err);
-              reject(err);
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
               return;
             }
 
@@ -212,11 +242,10 @@ class DaytonaService {
               onData(data.toString('utf-8'));
             });
 
-            // Handle stream close
+            // Handle stream close — uses the shared guard
             stream.on('close', () => {
               console.log(`[SSH] Stream closed for terminal ${terminalId}`);
-              this.sshConnections.delete(terminalId);
-              onClose?.();
+              handleClose();
             });
 
             // Handle stream error
@@ -225,7 +254,10 @@ class DaytonaService {
             });
 
             onReady?.();
-            resolve();
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
           }
         );
       });
@@ -234,43 +266,61 @@ class DaytonaService {
         console.error(`[SSH] Connection error for terminal ${terminalId}:`, err);
         this.sshConnections.delete(terminalId);
         onError?.(err);
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
       });
 
+      // Client-level close — uses the shared guard
       sshClient.on('close', () => {
         console.log(`[SSH] Connection closed for terminal ${terminalId}`);
-        this.sshConnections.delete(terminalId);
-        onClose?.();
+        handleClose();
       });
 
-      // Connect using SSH access details
+      // Connect using SSH access details with keepalive to prevent
+      // cloud platform (Render, etc.) idle timeouts from killing the connection
       sshClient.connect({
         host,
         port,
         username: user,
         password: sshAccess.token,
+        keepaliveInterval: 15000,  // Send keepalive every 15 seconds
+        keepaliveCountMax: 3,      // Allow 3 missed keepalives before disconnect
+        readyTimeout: 30000,       // 30 second connection timeout
       });
     });
   }
 
-  async writeTerminal(terminalId: string, data: string): Promise<void> {
+  async writeTerminal(terminalId: string, data: string): Promise<boolean> {
     const conn = this.sshConnections.get(terminalId);
-    if (!conn?.ready) throw new Error('Terminal SSH not connected');
+    if (!conn?.ready) return false;
 
-    conn.stream.write(data);
+    try {
+      conn.stream.write(data);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async resizeTerminal(terminalId: string, cols: number, rows: number): Promise<void> {
     const conn = this.sshConnections.get(terminalId);
-    if (!conn?.ready) throw new Error('Terminal SSH not connected');
+    if (!conn?.ready) return;
 
-    conn.stream.setWindow(rows, cols, 0, 0);
+    try {
+      conn.stream.setWindow(rows, cols, 0, 0);
+    } catch (err) {
+      console.error(`[SSH] Resize error for terminal ${terminalId}:`, err);
+    }
   }
 
   async closeTerminal(terminalId: string): Promise<void> {
     const conn = this.sshConnections.get(terminalId);
     if (conn) {
       try {
+        conn.stream.removeAllListeners();
+        conn.client.removeAllListeners();
         conn.stream.close();
         conn.client.end();
       } catch {
@@ -280,6 +330,11 @@ class DaytonaService {
     }
 
     this.terminals.delete(terminalId);
+  }
+
+  isTerminalConnected(terminalId: string): boolean {
+    const conn = this.sshConnections.get(terminalId);
+    return !!conn?.ready;
   }
 
   async listTerminals(): Promise<TerminalSession[]> {
