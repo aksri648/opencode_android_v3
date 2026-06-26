@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Mobile AI Workspace</string>
+    <string name="title_activity_main">Mobile AI Workspace</string>
+    <string name="package_name">com.mobileaiworkspace</string>
+    <string name="custom_url_scheme">com.mobileaiworkspace</string>
+</resources>
