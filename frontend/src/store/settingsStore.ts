@@ -12,7 +12,7 @@ interface SettingsState {
 }
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
-  backendUrl: '',
+  backendUrl: 'https://opencode-android-backend.onrender.com',
   connectionStatus: 'offline',
   setBackendUrl: (url) => set({ backendUrl: url }),
   setConnectionStatus: (status) => set({ connectionStatus: status }),
