@@ -88,6 +88,8 @@ export function setupWebSocket(server: Server): void {
               // onError: SSH connection failed
               (err: Error) => {
                 console.error(`[WS] SSH error for terminal ${terminal.id}:`, err);
+                client.sshConnected = false;
+                client.terminalId = undefined;
                 const errorResponse: TerminalMessage = {
                   type: 'error',
                   terminalId: terminal.id,
@@ -112,11 +114,15 @@ export function setupWebSocket(server: Server): void {
           case 'input': {
             if (msg.terminalId && msg.data) {
               if (client.sshConnected) {
-                await daytonaService.writeTerminal(msg.terminalId, msg.data);
+                try {
+                  await daytonaService.writeTerminal(msg.terminalId, msg.data);
+                } catch {
+                  client.sshConnected = false;
+                  client.inputQueue.push(msg.data);
+                }
               } else {
                 // Queue input until SSH is ready
                 client.inputQueue.push(msg.data);
-                console.log(`[WS] Queued input for terminal ${msg.terminalId} (SSH not ready)`);
               }
             }
             break;
