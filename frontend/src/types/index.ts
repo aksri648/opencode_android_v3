@@ -9,7 +9,7 @@ export interface Terminal {
   id: string;
   name: string;
   workspaceId: string;
-  status: 'connected' | 'disconnected' | 'error';
+  status: 'connecting' | 'connected' | 'disconnected' | 'error';
 }
 
 export interface FileNode {
