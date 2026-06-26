@@ -163,15 +163,24 @@ class DaytonaService {
     const sshAccess = await workspace.sandbox.createSshAccess();
     
     // Parse SSH command to extract host, port, user
-    // Format: ssh -p PORT USER@HOST
-    const sshCommandMatch = sshAccess.sshCommand.match(/ssh -p (\d+) (\S+)@(\S+)/);
-    if (!sshCommandMatch) {
+    // Formats: "ssh -p PORT USER@HOST" or "ssh USER@HOST"
+    let port = 22;
+    let user: string;
+    let host: string;
+
+    const withPortMatch = sshAccess.sshCommand.match(/ssh -p (\d+) (\S+)@(\S+)/);
+    const withoutPortMatch = sshAccess.sshCommand.match(/ssh (\S+)@(\S+)/);
+
+    if (withPortMatch) {
+      port = parseInt(withPortMatch[1], 10);
+      user = withPortMatch[2];
+      host = withPortMatch[3];
+    } else if (withoutPortMatch) {
+      user = withoutPortMatch[1];
+      host = withoutPortMatch[2];
+    } else {
       throw new Error(`Failed to parse SSH command: ${sshAccess.sshCommand}`);
     }
-    
-    const port = parseInt(sshCommandMatch[1], 10);
-    const user = sshCommandMatch[2];
-    const host = sshCommandMatch[3];
 
     const sshClient = new SSHClient();
 
