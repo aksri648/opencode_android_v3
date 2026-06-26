@@ -16,6 +16,8 @@ export function TerminalView() {
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const sshReadyRef = useRef<boolean>(false);
+  const inputQueueRef = useRef<string[]>([]);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [terminalName, setTerminalName] = useState('Terminal 1');
@@ -36,12 +38,15 @@ export function TerminalView() {
         wsRef.current.close();
       }
 
+      sshReadyRef.current = false;
+      inputQueueRef.current = [];
+
       const wsUrl = backendUrl.replace(/^http/, 'ws') + '/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        updateTerminalStatus(terminalId, 'connected');
+        updateTerminalStatus(terminalId, 'connecting');
         // Send create terminal message
         const msg: TerminalMessage = { type: 'create', terminalId };
         ws.send(JSON.stringify(msg));
@@ -50,11 +55,31 @@ export function TerminalView() {
       ws.onmessage = (event) => {
         try {
           const msg: TerminalMessage = JSON.parse(event.data);
+          
           if (msg.type === 'output' && msg.terminalId === terminalId && msg.data) {
             xtermRef.current?.write(msg.data);
           }
-          if (msg.type === 'created' && msg.terminalId) {
+          
+          if (msg.type === 'created' && msg.terminalId === terminalId) {
+            console.log(`[Terminal] SSH ready for terminal ${terminalId}`);
+            sshReadyRef.current = true;
             updateTerminalStatus(terminalId, 'connected');
+            
+            // Send any queued input
+            while (inputQueueRef.current.length > 0) {
+              const queuedData = inputQueueRef.current.shift()!;
+              const inputMsg: TerminalMessage = {
+                type: 'input',
+                terminalId,
+                data: queuedData,
+              };
+              ws.send(JSON.stringify(inputMsg));
+            }
+          }
+          
+          if (msg.type === 'error' && msg.terminalId === terminalId) {
+            console.error(`[Terminal] Error from backend:`, msg.data);
+            xtermRef.current?.write(`\r\n\x1b[31mError: ${msg.data}\x1b[0m\r\n`);
           }
         } catch {
           // Binary data or malformed
@@ -63,16 +88,18 @@ export function TerminalView() {
       };
 
       ws.onclose = () => {
+        sshReadyRef.current = false;
         updateTerminalStatus(terminalId, 'disconnected');
-        // Auto reconnect
+        // Auto reconnect after delay
         reconnectTimeoutRef.current = setTimeout(() => {
           if (activeTerminalId === terminalId) {
             connectWebSocket(terminalId);
           }
-        }, 3000);
+        }, 5000);
       };
 
       ws.onerror = () => {
+        sshReadyRef.current = false;
         updateTerminalStatus(terminalId, 'error');
       };
     },
@@ -116,7 +143,14 @@ export function TerminalView() {
           terminalId: activeTerminalId,
           data,
         };
-        wsRef.current.send(JSON.stringify(msg));
+        
+        if (sshReadyRef.current) {
+          wsRef.current.send(JSON.stringify(msg));
+        } else {
+          // Queue input until SSH is ready
+          inputQueueRef.current.push(data);
+          console.log(`[Terminal] Queued input (SSH not ready)`);
+        }
       }
     });
 

@@ -1,12 +1,20 @@
-import { Daytona, type Sandbox, type PtyHandle } from '@daytona/sdk';
+import { Daytona, type Sandbox } from '@daytona/sdk';
+import { Client as SSHClient, type ClientChannel } from 'ssh2';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../config';
 import type { Workspace, TerminalSession, FileNode } from '../types';
 
+interface SshConnection {
+  client: SSHClient;
+  stream: ClientChannel;
+  ready: boolean;
+}
+
 class DaytonaService {
   private daytona: Daytona;
   private workspaces: Map<string, Workspace> = new Map();
-  private terminals: Map<string, TerminalSession & { ptyHandle?: PtyHandle }> = new Map();
+  private terminals: Map<string, TerminalSession> = new Map();
+  private sshConnections: Map<string, SshConnection> = new Map();
 
   constructor() {
     this.daytona = new Daytona({
@@ -116,7 +124,7 @@ class DaytonaService {
     return this.createWorkspace();
   }
 
-  // ── Terminal (PTY) Management ───────────────────────────────
+  // ── Terminal (SSH) Management ───────────────────────────────
 
   async createTerminal(workspaceId: string, cols = 120, rows = 40): Promise<TerminalSession> {
     const workspace = this.workspaces.get(workspaceId);
@@ -127,7 +135,7 @@ class DaytonaService {
     const terminalId = uuidv4();
     const terminalName = `Terminal ${this.terminals.size + 1}`;
 
-    const terminal: TerminalSession & { ptyHandle?: PtyHandle } = {
+    const terminal: TerminalSession = {
       id: terminalId,
       name: terminalName,
       workspaceId,
@@ -138,60 +146,135 @@ class DaytonaService {
     return terminal;
   }
 
-  async connectTerminalPty(
+  async connectTerminalSsh(
     terminalId: string,
-    onData: (data: Uint8Array) => void,
-    cols = 120,
-    rows = 40
-  ): Promise<PtyHandle> {
+    onData: (data: string) => void,
+    onReady?: () => void,
+    onError?: (err: Error) => void,
+    onClose?: () => void
+  ): Promise<void> {
     const terminal = this.terminals.get(terminalId);
     if (!terminal) throw new Error('Terminal not found');
 
     const workspace = this.workspaces.get(terminal.workspaceId);
     if (!workspace?.sandbox) throw new Error('Workspace not found');
 
-    const ptyHandle = await workspace.sandbox.process.createPty({
-      id: terminalId,
-      cols,
-      rows,
-      onData,
-    });
+    // Get SSH access from Daytona
+    const sshAccess = await workspace.sandbox.createSshAccess();
+    
+    // Parse SSH command to extract host, port, user
+    // Format: ssh -p PORT USER@HOST
+    const sshCommandMatch = sshAccess.sshCommand.match(/ssh -p (\d+) (\S+)@(\S+)/);
+    if (!sshCommandMatch) {
+      throw new Error(`Failed to parse SSH command: ${sshAccess.sshCommand}`);
+    }
+    
+    const port = parseInt(sshCommandMatch[1], 10);
+    const user = sshCommandMatch[2];
+    const host = sshCommandMatch[3];
 
-    terminal.ptyHandle = ptyHandle;
-    return ptyHandle;
+    const sshClient = new SSHClient();
+
+    return new Promise<void>((resolve, reject) => {
+      sshClient.on('ready', () => {
+        console.log(`[SSH] Connected for terminal ${terminalId}`);
+
+        // Open a shell session
+        sshClient.shell(
+          {
+            term: 'xterm-256color',
+          },
+          (err: Error | undefined, stream: ClientChannel) => {
+            if (err) {
+              console.error(`[SSH] Shell error for terminal ${terminalId}:`, err);
+              onError?.(err);
+              reject(err);
+              return;
+            }
+
+            this.sshConnections.set(terminalId, {
+              client: sshClient,
+              stream,
+              ready: true,
+            });
+
+            // Handle stream data
+            stream.on('data', (data: Buffer) => {
+              onData(data.toString('utf-8'));
+            });
+
+            // Handle stream close
+            stream.on('close', () => {
+              console.log(`[SSH] Stream closed for terminal ${terminalId}`);
+              this.sshConnections.delete(terminalId);
+              onClose?.();
+            });
+
+            // Handle stream error
+            stream.stderr.on('data', (data: Buffer) => {
+              console.error(`[SSH] Stderr for terminal ${terminalId}:`, data.toString());
+            });
+
+            onReady?.();
+            resolve();
+          }
+        );
+      });
+
+      sshClient.on('error', (err: Error) => {
+        console.error(`[SSH] Connection error for terminal ${terminalId}:`, err);
+        this.sshConnections.delete(terminalId);
+        onError?.(err);
+        reject(err);
+      });
+
+      sshClient.on('close', () => {
+        console.log(`[SSH] Connection closed for terminal ${terminalId}`);
+        this.sshConnections.delete(terminalId);
+        onClose?.();
+      });
+
+      // Connect using SSH access details
+      sshClient.connect({
+        host,
+        port,
+        username: user,
+        password: sshAccess.token,
+      });
+    });
   }
 
   async writeTerminal(terminalId: string, data: string): Promise<void> {
-    const terminal = this.terminals.get(terminalId);
-    if (!terminal?.ptyHandle) throw new Error('Terminal PTY not connected');
+    const conn = this.sshConnections.get(terminalId);
+    if (!conn?.ready) throw new Error('Terminal SSH not connected');
 
-    await terminal.ptyHandle.sendInput(data);
+    conn.stream.write(data);
   }
 
   async resizeTerminal(terminalId: string, cols: number, rows: number): Promise<void> {
-    const terminal = this.terminals.get(terminalId);
-    if (!terminal?.ptyHandle) throw new Error('Terminal PTY not connected');
+    const conn = this.sshConnections.get(terminalId);
+    if (!conn?.ready) throw new Error('Terminal SSH not connected');
 
-    await terminal.ptyHandle.resize(cols, rows);
+    conn.stream.setWindow(rows, cols, 0, 0);
   }
 
   async closeTerminal(terminalId: string): Promise<void> {
-    const terminal = this.terminals.get(terminalId);
-    if (!terminal) return;
-
-    if (terminal.ptyHandle) {
+    const conn = this.sshConnections.get(terminalId);
+    if (conn) {
       try {
-        await terminal.ptyHandle.disconnect();
+        conn.stream.close();
+        conn.client.end();
       } catch {
         // Ignore disconnect errors
       }
+      this.sshConnections.delete(terminalId);
     }
 
     this.terminals.delete(terminalId);
   }
 
   async listTerminals(): Promise<TerminalSession[]> {
-    return Array.from(this.terminals.values()).map(({ ptyHandle: _, ...rest }) => rest);
+    return Array.from(this.terminals.values());
   }
 
   async deleteTerminal(id: string): Promise<boolean> {

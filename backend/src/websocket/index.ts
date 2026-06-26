@@ -2,13 +2,13 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Server } from 'http';
 import type { TerminalMessage } from '../types';
 import { daytonaService } from '../services/daytona';
-import type { PtyHandle } from '@daytona/sdk';
 
 interface ConnectedClient {
   ws: WebSocket;
   terminalId?: string;
   workspaceId?: string;
-  ptyHandle?: PtyHandle;
+  sshConnected: boolean;
+  inputQueue: string[];
 }
 
 export function setupWebSocket(server: Server): void {
@@ -18,7 +18,7 @@ export function setupWebSocket(server: Server): void {
 
   wss.on('connection', (ws: WebSocket) => {
     const clientId = crypto.randomUUID();
-    clients.set(clientId, { ws });
+    clients.set(clientId, { ws, sshConnected: false, inputQueue: [] });
 
     console.log(`[WS] Client connected: ${clientId}`);
 
@@ -37,6 +37,8 @@ export function setupWebSocket(server: Server): void {
 
         switch (msg.type) {
           case 'create': {
+            console.log(`[WS] Received create message from client ${clientId}`);
+
             // Get or create a workspace
             const workspace = await daytonaService.getOrCreateWorkspace();
             client.workspaceId = workspace.id;
@@ -49,32 +51,59 @@ export function setupWebSocket(server: Server): void {
             );
             client.terminalId = terminal.id;
 
-            // Connect PTY on the sandbox — onData bridges to the client WS
-            const ptyHandle = await daytonaService.connectTerminalPty(
+            // Connect via SSH
+            await daytonaService.connectTerminalSsh(
               terminal.id,
-              (ptyData: Uint8Array) => {
-                // Forward PTY output to client WebSocket
+              // onData: forward SSH output to client WebSocket
+              (sshData: string) => {
                 if (ws.readyState === WebSocket.OPEN) {
                   const response: TerminalMessage = {
                     type: 'output',
                     terminalId: terminal.id,
-                    data: new TextDecoder().decode(ptyData),
+                    data: sshData,
                   };
                   ws.send(JSON.stringify(response));
                 }
               },
-              msg.cols || 120,
-              msg.rows || 40
+              // onReady: SSH connected, notify client
+              () => {
+                console.log(`[WS] SSH ready for terminal ${terminal.id}`);
+                client.sshConnected = true;
+
+                // Send any queued input
+                while (client.inputQueue.length > 0) {
+                  const queuedData = client.inputQueue.shift()!;
+                  daytonaService.writeTerminal(terminal.id, queuedData).catch((err) => {
+                    console.error(`[WS] Failed to write queued input:`, err);
+                  });
+                }
+
+                // Notify client terminal is ready
+                const response: TerminalMessage = {
+                  type: 'created',
+                  terminalId: terminal.id,
+                };
+                ws.send(JSON.stringify(response));
+              },
+              // onError: SSH connection failed
+              (err: Error) => {
+                console.error(`[WS] SSH error for terminal ${terminal.id}:`, err);
+                const errorResponse: TerminalMessage = {
+                  type: 'error',
+                  terminalId: terminal.id,
+                  data: `SSH connection failed: ${err.message}`,
+                };
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify(errorResponse));
+                }
+              },
+              // onClose: SSH connection closed
+              () => {
+                console.log(`[WS] SSH closed for terminal ${terminal.id}`);
+                client.sshConnected = false;
+                client.terminalId = undefined;
+              }
             );
-
-            client.ptyHandle = ptyHandle;
-
-            // Notify client terminal is ready
-            const response: TerminalMessage = {
-              type: 'created',
-              terminalId: terminal.id,
-            };
-            ws.send(JSON.stringify(response));
 
             console.log(`[WS] Terminal created: ${terminal.id} on workspace ${workspace.id}`);
             break;
@@ -82,7 +111,13 @@ export function setupWebSocket(server: Server): void {
 
           case 'input': {
             if (msg.terminalId && msg.data) {
-              await daytonaService.writeTerminal(msg.terminalId, msg.data);
+              if (client.sshConnected) {
+                await daytonaService.writeTerminal(msg.terminalId, msg.data);
+              } else {
+                // Queue input until SSH is ready
+                client.inputQueue.push(msg.data);
+                console.log(`[WS] Queued input for terminal ${msg.terminalId} (SSH not ready)`);
+              }
             }
             break;
           }
@@ -98,7 +133,8 @@ export function setupWebSocket(server: Server): void {
             if (msg.terminalId) {
               await daytonaService.closeTerminal(msg.terminalId);
               client.terminalId = undefined;
-              client.ptyHandle = undefined;
+              client.sshConnected = false;
+              client.inputQueue = [];
             }
             break;
           }
@@ -119,7 +155,7 @@ export function setupWebSocket(server: Server): void {
       clearInterval(heartbeat);
       const client = clients.get(clientId);
 
-      // Clean up PTY
+      // Clean up SSH connection
       if (client?.terminalId) {
         try {
           await daytonaService.closeTerminal(client.terminalId);
